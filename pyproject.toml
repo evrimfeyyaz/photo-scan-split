@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-scan-split"
+version = "0.1.0"
+description = "Scan photos from a WiFi scanner and automatically split them into individual images"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "zeroconf>=0.131",
+    "requests>=2.31",
+    "lxml>=5.0",
+    "opencv-python-headless>=4.9",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+]
+
+[project.scripts]
+photo-scan-split = "photo_scan_split.cli:cli"
