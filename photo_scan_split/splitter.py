@@ -1,8 +1,8 @@
 """Detect and split individual photos from a scanned image.
 
-Uses watershed segmentation with distance transform and edge-based gap
-detection to reliably separate photos, including ones placed close
-together or touching on the scanner bed.
+Uses watershed segmentation with distance transform to reliably separate
+photos placed on the scanner bed.  Includes face-detection-based auto
+orientation for extracted photos.
 """
 
 from __future__ import annotations
@@ -44,131 +44,70 @@ def _remove_contained(photos: list[DetectedPhoto]) -> list[DetectedPhoto]:
     return keep
 
 
-def _find_peak_positions(profile: np.ndarray, min_distance: int) -> list[int]:
-    """Find significant peaks in a 1D profile (above median + 2*std).
+def _auto_orient(pil_img: Image.Image) -> Image.Image:
+    """Correct photo orientation using face detection.
 
-    Peaks closer than *min_distance* apart are merged, keeping the
-    strongest.  Returns a list of peak indices into *profile*.
+    Tries all four 90-degree rotations, runs frontal and profile face
+    detection on each, and picks the rotation with the strongest
+    detection.  Returns the original unchanged when no faces are found.
     """
-    if len(profile) == 0 or profile.max() == 0:
-        return []
-    med = float(np.median(profile))
-    std = float(np.std(profile))
-    if std < 1e-6:
-        return []
-    threshold = med + 2.0 * std
+    img = np.array(pil_img)
+    if img.ndim == 3 and img.shape[2] >= 3:
+        gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2GRAY)
+    elif img.ndim == 2:
+        gray = img
+    else:
+        return pil_img
 
-    above = profile > threshold
-    peaks: list[int] = []
-    i = 0
-    while i < len(profile):
-        if above[i]:
-            j = i
-            while j < len(profile) and above[j]:
-                j += 1
-            peak = i + int(np.argmax(profile[i:j]))
-            if not peaks or (peak - peaks[-1]) >= min_distance:
-                peaks.append(peak)
-            elif profile[peak] > profile[peaks[-1]]:
-                peaks[-1] = peak
-            i = j
-        else:
-            i += 1
-    return peaks
+    max_dim = 800
+    h, w = gray.shape
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        small = gray
 
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+    )
+    profile_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_profileface.xml"
+    )
 
-def _cut_touching_blobs(
-    mask: np.ndarray,
-    gray: np.ndarray,
-    min_area: int,
-) -> np.ndarray:
-    """Detect and sever boundaries between touching or very close photos.
+    candidates = [
+        (0, small),
+        (90, cv2.rotate(small, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+        (180, cv2.rotate(small, cv2.ROTATE_180)),
+        (270, cv2.rotate(small, cv2.ROTATE_90_CLOCKWISE)),
+    ]
 
-    For each connected component large enough to contain multiple photos,
-    projects directional Sobel gradient magnitudes onto vertical and
-    horizontal axes.  A sharp peak in gradient density indicates a
-    content boundary between two photos — a thin cut is drawn through the
-    mask at that position so that downstream watershed can separate them.
-    """
-    h_img, w_img = mask.shape
-    num_blobs, blob_labels = cv2.connectedComponents(mask)
-    if num_blobs <= 1:
-        return mask
+    best_angle = 0
+    best_score = 0
 
-    min_photo_dim = max(int(min(h_img, w_img) * 0.08), 50)
-    cut_half = 2  # total cut width = 2 * cut_half + 1 = 5 px
+    for angle, rotated in candidates:
+        min_face = max(30, int(min(rotated.shape[:2]) * 0.04))
+        detect_kw = dict(
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(min_face, min_face),
+        )
+        frontal = face_cascade.detectMultiScale(rotated, **detect_kw)
+        profile = profile_cascade.detectMultiScale(rotated, **detect_kw)
 
-    grad_x = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
-    grad_y = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+        score = len(frontal) * 2 + len(profile)
+        if score > best_score:
+            best_score = score
+            best_angle = angle
 
-    result = mask.copy()
+    if best_angle == 0 or best_score == 0:
+        return pil_img
 
-    for blob_id in range(1, num_blobs):
-        blob_mask = blob_labels == blob_id
-        blob_area = int(np.sum(blob_mask))
-        if blob_area < min_area * 1.5:
-            continue
-
-        ys, xs = np.where(blob_mask)
-        y0, y1 = int(ys.min()), int(ys.max())
-        x0, x1 = int(xs.min()), int(xs.max())
-        bh, bw = y1 - y0 + 1, x1 - x0 + 1
-
-        crop_blob = blob_mask[y0 : y1 + 1, x0 : x1 + 1]
-
-        # --- vertical cuts (side-by-side photos) ---
-        if bw >= min_photo_dim * 1.5:
-            crop_gx = grad_x[y0 : y1 + 1, x0 : x1 + 1].copy()
-            crop_gx[~crop_blob] = 0.0
-
-            col_grad = np.sum(crop_gx, axis=0)
-            col_cov = np.maximum(np.sum(crop_blob, axis=0).astype(np.float64), 1.0)
-            density = col_grad / col_cov
-
-            k = max(5, bw // 30)
-            if k % 2 == 0:
-                k += 1
-            smooth = cv2.GaussianBlur(
-                density.reshape(1, -1).astype(np.float32), (1, k), 0,
-            ).flatten()
-
-            margin = max(min_photo_dim // 2, bw // 8)
-            if margin < bw - margin:
-                interior = smooth[margin : bw - margin]
-                for p in _find_peak_positions(interior, min_photo_dim):
-                    col_abs = p + margin + x0
-                    for dc in range(-cut_half, cut_half + 1):
-                        cc = col_abs + dc
-                        if 0 <= cc < w_img:
-                            result[y0 : y1 + 1, cc][blob_mask[y0 : y1 + 1, cc]] = 0
-
-        # --- horizontal cuts (top-bottom photos) ---
-        if bh >= min_photo_dim * 1.5:
-            crop_gy = grad_y[y0 : y1 + 1, x0 : x1 + 1].copy()
-            crop_gy[~crop_blob] = 0.0
-
-            row_grad = np.sum(crop_gy, axis=1)
-            row_cov = np.maximum(np.sum(crop_blob, axis=1).astype(np.float64), 1.0)
-            density = row_grad / row_cov
-
-            k = max(5, bh // 30)
-            if k % 2 == 0:
-                k += 1
-            smooth = cv2.GaussianBlur(
-                density.reshape(-1, 1).astype(np.float32), (k, 1), 0,
-            ).flatten()
-
-            margin = max(min_photo_dim // 2, bh // 8)
-            if margin < bh - margin:
-                interior = smooth[margin : bh - margin]
-                for p in _find_peak_positions(interior, min_photo_dim):
-                    row_abs = p + margin + y0
-                    for dr in range(-cut_half, cut_half + 1):
-                        rr = row_abs + dr
-                        if 0 <= rr < h_img:
-                            result[rr, x0 : x1 + 1][blob_mask[rr, x0 : x1 + 1]] = 0
-
-    return result
+    transpose_map = {
+        90: Image.Transpose.ROTATE_90,
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_270,
+    }
+    return pil_img.transpose(transpose_map[best_angle])
 
 
 def split_photos(
@@ -209,14 +148,10 @@ def split_photos(
     _, binary = cv2.threshold(blurred, bg_threshold, 255, cv2.THRESH_BINARY_INV)
 
     # Open removes noise; close bridges small bright gaps within photos.
-    # The close kernel is kept small to avoid merging nearby photos.
     open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k, iterations=2)
     close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k, iterations=1)
-
-    # --- Sever touching / very close photos ---
-    mask = _cut_touching_blobs(mask, gray, int(min_area))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k, iterations=2)
 
     # --- Sure background ---
     bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -293,6 +228,8 @@ def split_photos(
             pil_img = Image.fromarray(cropped, mode="L")
         else:
             pil_img = Image.fromarray(cropped)
+
+        pil_img = _auto_orient(pil_img)
 
         photos.append(DetectedPhoto(
             image=pil_img,

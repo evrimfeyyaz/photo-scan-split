@@ -11,6 +11,7 @@
 - Scanner protocol: eSCL (AirScan) over HTTP, discovered via mDNS (`_uscan._tcp.local.`)
 - Tech stack: Python, Click, zeroconf, requests, lxml, opencv-python-headless, Pillow, numpy
 - Dark scanner lid requires auto-detection of background brightness (Otsu's method) instead of a hardcoded threshold
-- Photo splitting uses watershed segmentation with distance transform + directional Sobel gradient projection to cut touching/close photos
+- Photo splitting uses watershed segmentation with distance transform; edge-based blob cutting was tried but produces false positives on high-contrast photos (people against dark backgrounds)
+- Auto-orientation uses OpenCV Haar cascade face detection (frontal + profile), trying all 4 rotations
 - Three CLI commands: `scan` (full pipeline), `discover` (list scanners), `split` (split existing image)
 - Entry points: `photo-scan-split` console script and `python -m photo_scan_split`
