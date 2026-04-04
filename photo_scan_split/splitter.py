@@ -1,7 +1,8 @@
 """Detect and split individual photos from a scanned image.
 
-Uses watershed segmentation with distance transform to reliably separate
-photos placed with visible gaps on the scanner bed.
+Uses watershed segmentation with distance transform and edge-based gap
+detection to reliably separate photos, including ones placed close
+together or touching on the scanner bed.
 """
 
 from __future__ import annotations
@@ -43,6 +44,133 @@ def _remove_contained(photos: list[DetectedPhoto]) -> list[DetectedPhoto]:
     return keep
 
 
+def _find_peak_positions(profile: np.ndarray, min_distance: int) -> list[int]:
+    """Find significant peaks in a 1D profile (above median + 2*std).
+
+    Peaks closer than *min_distance* apart are merged, keeping the
+    strongest.  Returns a list of peak indices into *profile*.
+    """
+    if len(profile) == 0 or profile.max() == 0:
+        return []
+    med = float(np.median(profile))
+    std = float(np.std(profile))
+    if std < 1e-6:
+        return []
+    threshold = med + 2.0 * std
+
+    above = profile > threshold
+    peaks: list[int] = []
+    i = 0
+    while i < len(profile):
+        if above[i]:
+            j = i
+            while j < len(profile) and above[j]:
+                j += 1
+            peak = i + int(np.argmax(profile[i:j]))
+            if not peaks or (peak - peaks[-1]) >= min_distance:
+                peaks.append(peak)
+            elif profile[peak] > profile[peaks[-1]]:
+                peaks[-1] = peak
+            i = j
+        else:
+            i += 1
+    return peaks
+
+
+def _cut_touching_blobs(
+    mask: np.ndarray,
+    gray: np.ndarray,
+    min_area: int,
+) -> np.ndarray:
+    """Detect and sever boundaries between touching or very close photos.
+
+    For each connected component large enough to contain multiple photos,
+    projects directional Sobel gradient magnitudes onto vertical and
+    horizontal axes.  A sharp peak in gradient density indicates a
+    content boundary between two photos — a thin cut is drawn through the
+    mask at that position so that downstream watershed can separate them.
+    """
+    h_img, w_img = mask.shape
+    num_blobs, blob_labels = cv2.connectedComponents(mask)
+    if num_blobs <= 1:
+        return mask
+
+    min_photo_dim = max(int(min(h_img, w_img) * 0.08), 50)
+    cut_half = 2  # total cut width = 2 * cut_half + 1 = 5 px
+
+    grad_x = np.abs(cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3))
+    grad_y = np.abs(cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3))
+
+    result = mask.copy()
+
+    for blob_id in range(1, num_blobs):
+        blob_mask = blob_labels == blob_id
+        blob_area = int(np.sum(blob_mask))
+        if blob_area < min_area * 1.5:
+            continue
+
+        ys, xs = np.where(blob_mask)
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        bh, bw = y1 - y0 + 1, x1 - x0 + 1
+
+        crop_blob = blob_mask[y0 : y1 + 1, x0 : x1 + 1]
+
+        # --- vertical cuts (side-by-side photos) ---
+        if bw >= min_photo_dim * 1.5:
+            crop_gx = grad_x[y0 : y1 + 1, x0 : x1 + 1].copy()
+            crop_gx[~crop_blob] = 0.0
+
+            col_grad = np.sum(crop_gx, axis=0)
+            col_cov = np.maximum(np.sum(crop_blob, axis=0).astype(np.float64), 1.0)
+            density = col_grad / col_cov
+
+            k = max(5, bw // 30)
+            if k % 2 == 0:
+                k += 1
+            smooth = cv2.GaussianBlur(
+                density.reshape(1, -1).astype(np.float32), (1, k), 0,
+            ).flatten()
+
+            margin = max(min_photo_dim // 2, bw // 8)
+            if margin < bw - margin:
+                interior = smooth[margin : bw - margin]
+                for p in _find_peak_positions(interior, min_photo_dim):
+                    col_abs = p + margin + x0
+                    for dc in range(-cut_half, cut_half + 1):
+                        cc = col_abs + dc
+                        if 0 <= cc < w_img:
+                            result[y0 : y1 + 1, cc][blob_mask[y0 : y1 + 1, cc]] = 0
+
+        # --- horizontal cuts (top-bottom photos) ---
+        if bh >= min_photo_dim * 1.5:
+            crop_gy = grad_y[y0 : y1 + 1, x0 : x1 + 1].copy()
+            crop_gy[~crop_blob] = 0.0
+
+            row_grad = np.sum(crop_gy, axis=1)
+            row_cov = np.maximum(np.sum(crop_blob, axis=1).astype(np.float64), 1.0)
+            density = row_grad / row_cov
+
+            k = max(5, bh // 30)
+            if k % 2 == 0:
+                k += 1
+            smooth = cv2.GaussianBlur(
+                density.reshape(-1, 1).astype(np.float32), (k, 1), 0,
+            ).flatten()
+
+            margin = max(min_photo_dim // 2, bh // 8)
+            if margin < bh - margin:
+                interior = smooth[margin : bh - margin]
+                for p in _find_peak_positions(interior, min_photo_dim):
+                    row_abs = p + margin + y0
+                    for dr in range(-cut_half, cut_half + 1):
+                        rr = row_abs + dr
+                        if 0 <= rr < h_img:
+                            result[rr, x0 : x1 + 1][blob_mask[rr, x0 : x1 + 1]] = 0
+
+    return result
+
+
 def split_photos(
     image: Image.Image,
     min_area_pct: float = 3.0,
@@ -81,10 +209,14 @@ def split_photos(
     _, binary = cv2.threshold(blurred, bg_threshold, 255, cv2.THRESH_BINARY_INV)
 
     # Open removes noise; close bridges small bright gaps within photos.
+    # The close kernel is kept small to avoid merging nearby photos.
     open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k, iterations=2)
-    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k, iterations=2)
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k, iterations=1)
+
+    # --- Sever touching / very close photos ---
+    mask = _cut_touching_blobs(mask, gray, int(min_area))
 
     # --- Sure background ---
     bg_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -109,7 +241,7 @@ def split_photos(
         local_max = blob_dist.max()
         if local_max == 0:
             continue
-        sure_fg[(blob_dist > 0.5 * local_max)] = 255
+        sure_fg[(blob_dist > 0.35 * local_max)] = 255
 
     if sure_fg.max() == 0:
         return []
